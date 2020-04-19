@@ -1,32 +1,27 @@
 ---
 - name: Setup Jitsi
+
+  # This requires an host group named 'install_jitsi'
+  # in your ansible setup. So change this if necessary.
   hosts:
     - install_jitsi
 
-  # if you use these vars, comment the "load secrets" task out
+  # put this vars into the host variables of your inventory
 
   # vars:
-  #   jitsisecrets:
-  #     hostname: jitsi
-  #     domain: meet.example.com
-  #     domainshort: meet
-  #     publicip: "8.8.8.8"
-  #     owner: "Max Mustermann"
-  #     email: "max@example.com"
-  #     imprint: "https://example.com/imprint.html"
-  #     privacy: "https://example.com/privacy.html"
+  #   jitsi_hostname: jitsi
+  #   jitsi_domain: meet.example.com
+  #   jitsi_domainshort: meet
+  #   jitsi_publicip: "8.8.8.8"
+  #   jitsi_publicipv6: "::1"
+  #   jitsi_owner: "Max Mustermann"
+  #   jitsi_email: "max@example.com"
+  #   jitsi_imprint: "https://example.com/imprint.html"
+  #   jitsi_privacy: "https://example.com/privacy.html"
 
   tasks:
 
-    - name: Load secrets
-      include_vars:
-        file: ../secrets_jitsi.yml
-        name: jitsisecrets
-      tags:
-        - always
-
-
-    # -> Disable annoying system defaults
+    # -> Change annoying system defaults
 
     - name: Create .vimrc
       copy:
@@ -41,11 +36,18 @@
           set mouse=
       loop:
         - "/root/.vimrc"
+      tags:
+        - prepare
+
+
+    # -> Configure hostname if cloudinit is present
 
     - name: Is cloudinit installed?
       stat:
         path: /etc/cloud/cloud.cfg
       register: iscloudinit
+      tags:
+        - prepare
 
     - name: Disable /etc/hosts handling in cloudinit
       replace:
@@ -57,9 +59,8 @@
         - '(\s+)(-\s+update_hostname)'
         - '(\s+)(-\s+update_etc_hosts)'
       when: iscloudinit.stat.exists
-
-
-    # -> Set hostname
+      tags:
+        - prepare
 
     - name: Create hosts file
       copy:
@@ -71,8 +72,8 @@
           # This file is managed by ansible
 
           # system hostnames
-          127.0.1.1 {{jitsisecrets.hostname}}
-          127.0.0.1 localhost {{jitsisecrets.domain}} {{jitsisecrets.domainshort}}
+          127.0.1.1 {{jitsi_hostname}}
+          127.0.0.1 localhost {{jitsi_domain}} {{jitsi_domainshort}}
 
           # The following lines are desirable for IPv6 capable hosts
           ::1 ip6-localhost ip6-loopback
@@ -81,20 +82,28 @@
           ff02::1 ip6-allnodes
           ff02::2 ip6-allrouters
           ff02::3 ip6-allhosts
+      when: iscloudinit.stat.exists
+      tags:
+        - prepare
 
     - name: Set hostname
       hostname:
-        name: "{{jitsisecrets.hostname}}"
+        name: "{{jitsi_hostname}}"
         use: debian
+      when: iscloudinit.stat.exists
+      tags:
+        - prepare
 
 
-    # -> Add jitsi package repo
+    # -> Install core packages
 
     - name: Install core packages
       apt:
         name:
           - apt-transport-https
           - debconf-utils
+          - net-tools
+          - dnsutils
           - expect
           - htop
           - vim
@@ -106,22 +115,33 @@
         force_apt_get: yes
         cache_valid_time: 3600
         update_cache: yes
+      tags:
+        - install
+
+
+    # -> Add jitsi repo
 
     - name: Add key for jitsi repo
       apt_key:
         url: https://download.jitsi.org/jitsi-key.gpg.key
         state: present
+      tags:
+        - install
 
     - apt_repository:
         repo: "deb https://download.jitsi.org stable/"
         filename: jitsi
         state: present
+      tags:
+        - install
 
     - name: Update package cache
       apt:
         autoclean: yes
         cache_valid_time: 0
         update_cache: yes
+      tags:
+        - install
 
 
     # -> Preconfigure jitsi packages with debconf
@@ -134,8 +154,10 @@
         vtype: "{{item[2]}}"
       loop:
         # root@jitsi:~# debconf-get-selections | grep -P "(jibri|jicofo|jigasi|jitsi)"
-        - [ "jitsi-videobridge2", "jitsi-videobridge/jvb-hostname", "string", "{{jitsisecrets.domain}}" ]
+        - [ "jitsi-videobridge2", "jitsi-videobridge/jvb-hostname", "string", "{{jitsi_domain}}" ]
         - [ "jitsi-meet-web-config", "jitsi-meet/cert-choice", "select", "Generate a new self-signed certificate (You will later get a chance to obtain a Let's encrypt certificate)" ]
+      tags:
+        - install
 
 
     # -> Install Jitsi
@@ -145,6 +167,8 @@
         name:
           - jitsi-meet
           - jitsi-meet-turnserver
+      tags:
+        - install
 
 
     # -> Ensure the public ip in coturn config
@@ -155,60 +179,97 @@
       lineinfile:
         path: /etc/turnserver.conf
         regexp: '^external-ip='
-        line: "external-ip={{jitsisecrets.publicip}}"
+        line: "external-ip={{jitsi_publicip}}"
       register: turncfg
+      tags:
+        - configure
 
-    - name: Ensure the public ip in coturn config
+    # coturn is used in tcp mode by prosody and nginx,
+    # but per default tcp is disabled.
+    # so enable tcp.
+    - name: Ensure tcp is enabled
       lineinfile:
         path: /etc/turnserver.conf
         regexp: 'no-tcp'
         line: '# no-tcp'
       register: turncfgtcp
+      tags:
+        - configure
 
     - name: Restart coturn if cfg was changed
       service:
         name: coturn
         state: restarted
       when: turncfg.changed or turncfgtcp.changed
+      tags:
+        - configure
 
 
     # -> Enable Lets Encrypt
 
     - name: Check if certbot had created certs yet
       stat:
-        path: "/etc/letsencrypt/live/{{jitsisecrets.domain}}/fullchain.pem"
+        path: "/etc/letsencrypt/live/{{jitsi_domain}}/fullchain.pem"
       register: certexists
+      tags:
+        - configure
 
     - name: Check if the nginx config needs to configured
-      command: grep -Fq "/etc/jitsi/meet/{{jitsisecrets.domain}}.crt" /etc/nginx/sites-available/{{jitsisecrets.domain}}.conf
+      command: grep -Fq "/etc/jitsi/meet/{{jitsi_domain}}.crt" /etc/nginx/sites-available/{{jitsi_domain}}.conf
       register: nginxisunconfigured
       changed_when: nginxisunconfigured.rc == 0
       failed_when: nginxisunconfigured.rc not in [0,1]
+      tags:
+        - configure
 
     - name: Check if the turnserver config needs to configured
-      command: grep -Fq "/etc/jitsi/meet/{{jitsisecrets.domain}}.crt" /etc/turnserver.conf
+      command: grep -Fq "/etc/jitsi/meet/{{jitsi_domain}}.crt" /etc/turnserver.conf
       register: turnunconfigured
       changed_when: turnunconfigured.rc == 0
       failed_when: turnunconfigured.rc not in [0,1]
+      tags:
+        - configure
 
     - name: Execute lets encrypt bootstrap script
       shell: |
         set timeout 600
         spawn /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
         expect "* email * \\\[ENTER\\\]: "
-        send "{{jitsisecrets.email}}\n"
+        send "{{jitsi_email}}\n"
         expect eof
       args:
         executable: /usr/bin/expect
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: leinstall
       when: certexists.stat.exists == False or nginxisunconfigured.rc == 0
+      tags:
+        - configure
+
+    - name: Check if certbot had created certs yet again
+      stat:
+        path: "/etc/letsencrypt/live/{{jitsi_domain}}/fullchain.pem"
+      register: certexistsagain
+      tags:
+        - configure
+
+    - name: Show certbot output and fail
+      fail:
+        msg: "Lets Encrypt failed: {{leinstall.stdout}}"
+      when: certexistsagain.stat.exists == False
+      tags:
+        - configure
 
     - name: Enforce the certbook renewal hooks
       shell: |
         /etc/letsencrypt/renewal-hooks/deploy/0000-coturn-certbot-deploy.sh
       environment:
-        RENEWED_LINEAGE: "/etc/letsencrypt/live/{{jitsisecrets.domain}}"
-        RENEWED_DOMAINS: "{{jitsisecrets.domain}}"
+        DEBIAN_FRONTEND: noninteractive
+        RENEWED_LINEAGE: "/etc/letsencrypt/live/{{jitsi_domain}}"
+        RENEWED_DOMAINS: "{{jitsi_domain}}"
       when: turnunconfigured.rc == 0
+      tags:
+        - configure
 
     - name: Restart services
       systemd:
@@ -220,13 +281,15 @@
         - jitsi-videobridge2
         - coturn
       when: nginxisunconfigured.rc == 0 or turnunconfigured.rc == 0
+      tags:
+        - configure
 
 
     # -> jitsi-meet config.js
 
     - name: Jitsi-meet config
       copy:
-        dest: /etc/jitsi/meet/{{jitsisecrets.domain}}-config.js
+        dest: /etc/jitsi/meet/{{jitsi_domain}}-config.js
         owner: root
         group: root
         mode: u=rw,go=r
@@ -239,14 +302,14 @@
 
               hosts: {
                   // XMPP domain.
-                  domain: '{{jitsisecrets.domain}}',
+                  domain: '{{jitsi_domain}}',
 
                   // XMPP MUC domain. FIXME: use XEP-0030 to discover it.
-                  muc: 'conference.<!--# echo var="subdomain" default="" -->{{jitsisecrets.domain}}'
+                  muc: 'conference.<!--# echo var="subdomain" default="" -->{{jitsi_domain}}'
               },
 
               // BOSH URL. FIXME: use XEP-0156 to discover it.
-              bosh: '//{{jitsisecrets.domain}}/http-bind',
+              bosh: '//{{jitsi_domain}}/http-bind',
 
               // The name of client node advertised in XEP-0115 'c' stanza
               clientNode: 'http://jitsi.org/jitsimeet',
@@ -277,7 +340,7 @@
               startAudioOnly: true,
 
               // Sets the preferred resolution (height) for local video. Defaults to 720.
-              resolution: 720,
+              resolution: 480,
 
               // The ID of the jidesha extension for Chrome.
               desktopSharingChromeExtId: null,
@@ -353,7 +416,7 @@
 
                       // { urls: 'stun:jitsi-meet.example.com:4446' },
                       // { urls: 'stun:meet-jit-si-turnrelay.jitsi.net:443' }
-                      { urls: 'stun:{{jitsisecrets.domain}}:443' }
+                      { urls: 'stun:{{jitsi_domain}}:443' }
                   ],
 
                   // Sets the ICE transport policy for the p2p connection. At the time
@@ -388,6 +451,8 @@
           };
 
           /* eslint-enable no-unused-vars, no-var */
+      tags:
+        - configure
 
 
     # -> Enable colibri api
@@ -398,6 +463,8 @@
         regexp: '^JVB_OPTS='
         line: 'JVB_OPTS="--apis=rest,xmpp"'
       register: vbrcfg
+      tags:
+        - extra
 
     - name: Enable statistics interface
       lineinfile:
@@ -405,6 +472,8 @@
         regexp: '^org\.jitsi\.videobridge\.STATISTICS_TRANSPORT='
         line: 'org.jitsi.videobridge.STATISTICS_TRANSPORT=muc,colibri'
       register: vbrcoli
+      tags:
+        - extra
 
     - name: Bind rest interface to localhost
       lineinfile:
@@ -412,6 +481,8 @@
         regexp: '^org\.jitsi\.videobridge\.rest\.private\.jetty\.host='
         line: 'org.jitsi.videobridge.rest.private.jetty.host=127.0.0.1'
       register: vbrlocal
+      tags:
+        - extra
 
     - name: Restart Videobridge when config was changed
       systemd:
@@ -420,6 +491,8 @@
         daemon_reload: yes
         state: restarted
       when: vbrcfg.changed or vbrcoli.changed or vbrlocal.changed
+      tags:
+        - extra
 
 
     # -> Other configs
@@ -431,7 +504,7 @@
           User-agent: *
           Disallow: /
       tags:
-        - customs
+        - extra
 
     - name: footer
       copy:
@@ -439,10 +512,10 @@
         content: |
           <template id = "welcome-page-additional-content-template">
               <div style="display: block; margin: 20px 0px; text-align: center;">
-                  Hosted by {{jitsisecrets.owner}} &middot;
+                  Hosted by {{jitsi_owner}} &middot;
                   <a href="https://jitsi.org/" target="_blank">Powered by Jitsi Meet</a> &middot;
-                  <a href="{{jitsisecrets.imprint}}" target="_blank">Imprint</a> &middot;
-                  <a href="{{jitsisecrets.privacy}}" target="_blank">Privacy</a>
+                  <a href="{{jitsi_imprint}}" target="_blank">Imprint</a> &middot;
+                  <a href="{{jitsi_privacy}}" target="_blank">Privacy</a>
               </div>
           </template>
 
@@ -453,7 +526,7 @@
               }
           </style>
       tags:
-        - customs
+        - extra
 
 
     #-> Local check
@@ -503,3 +576,38 @@
           fi
 
           echo "$scode $service $metrics $sname: $detail"
+      tags:
+        - extra
+
+
+    #-> DNS Records
+
+    # you need to setup the DNS records manually
+    # this task just generates a list of required records to help you with that
+    - name: Create a textfile with DNS records in root homefolder
+      copy:
+        dest: /root/jitsi-meet-dns-{{jitsi_domain}}.txt
+        owner: root
+        group: root
+        mode: u=rw,go=-
+        content: |
+          # the following DNS records should be set:
+
+          {{jitsi_domain}}.	3600	IN	A	{{jitsi_publicip}}
+          {{jitsi_domain}}.	3600	IN	AAAA	{{jitsi_publicipv6}}
+          stun.{{jitsi_domain}}.	3600	IN	A	{{jitsi_publicip}}
+          stun.{{jitsi_domain}}.	3600	IN	AAAA	{{jitsi_publicipv6}}
+          turn.{{jitsi_domain}}.	3600	IN	A	{{jitsi_publicip}}
+          turn.{{jitsi_domain}}.	3600	IN	AAAA	{{jitsi_publicipv6}}
+          _stun._tcp.{{jitsi_domain}}. 3600 IN	SRV	30 5 4446 stun.{{jitsi_domain}}.
+          _stun._udp.{{jitsi_domain}}. 3600 IN	SRV	30 5 4446 stun.{{jitsi_domain}}.
+          _stuns._tcp.{{jitsi_domain}}. 3600 IN	SRV	10 5 443 stun.{{jitsi_domain}}.
+          _stuns._udp.{{jitsi_domain}}. 3600 IN	SRV	20 5 4445 stun.{{jitsi_domain}}.
+          _turn._tcp.{{jitsi_domain}}. 3600 IN	SRV	30 5 4446 turn.{{jitsi_domain}}.
+          _turn._udp.{{jitsi_domain}}. 3600 IN	SRV	30 5 4446 turn.{{jitsi_domain}}.
+          _turns._tcp.{{jitsi_domain}}. 3600 IN	SRV	10 5 443 turn.{{jitsi_domain}}.
+          _turns._udp.{{jitsi_domain}}. 3600 IN	SRV	20 5 4445 turn.{{jitsi_domain}}.
+      tags:
+        - extra
+
+# eof
