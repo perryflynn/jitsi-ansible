@@ -1,0 +1,19 @@
+---
+- name: Setup Jitsi
+  hosts:
+    - install_jitsi
+
+  tasks:
+
+    - name: Uninstall packages
+      apt:
+        state: absent
+        purge: yes
+        autoremove: yes
+        cache_valid_time: 0
+        autoclean: yes
+        name:
+          - jitsi-meet
+          - jitsi-meet-turnserver
+
+# eof
