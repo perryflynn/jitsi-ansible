@@ -1,0 +1,505 @@
+---
+- name: Setup Jitsi
+  hosts:
+    - install_jitsi
+
+  # if you use these vars, comment the "load secrets" task out
+
+  # vars:
+  #   jitsisecrets:
+  #     hostname: jitsi
+  #     domain: meet.example.com
+  #     domainshort: meet
+  #     publicip: "8.8.8.8"
+  #     owner: "Max Mustermann"
+  #     email: "max@example.com"
+  #     imprint: "https://example.com/imprint.html"
+  #     privacy: "https://example.com/privacy.html"
+
+  tasks:
+
+    - name: Load secrets
+      include_vars:
+        file: ../secrets_jitsi.yml
+        name: jitsisecrets
+      tags:
+        - always
+
+
+    # -> Disable annoying system defaults
+
+    - name: Create .vimrc
+      copy:
+        dest: "{{item}}"
+        owner: root
+        group: root
+        mode: "u=rw,go=r"
+        content: |
+          " this file is managed by ansible
+          syntax on
+          set background=dark
+          set mouse=
+      loop:
+        - "/root/.vimrc"
+
+    - name: Is cloudinit installed?
+      stat:
+        path: /etc/cloud/cloud.cfg
+      register: iscloudinit
+
+    - name: Disable /etc/hosts handling in cloudinit
+      replace:
+        path: "{{iscloudinit.stat.path}}"
+        regexp: '{{item}}'
+        replace: '\1#\2'
+      loop:
+        - '(\s+)(-\s+set_hostname)'
+        - '(\s+)(-\s+update_hostname)'
+        - '(\s+)(-\s+update_etc_hosts)'
+      when: iscloudinit.stat.exists
+
+
+    # -> Set hostname
+
+    - name: Create hosts file
+      copy:
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: 'u=rw,go=r'
+        content: |
+          # This file is managed by ansible
+
+          # system hostnames
+          127.0.1.1 {{jitsisecrets.hostname}}
+          127.0.0.1 localhost {{jitsisecrets.domain}} {{jitsisecrets.domainshort}}
+
+          # The following lines are desirable for IPv6 capable hosts
+          ::1 ip6-localhost ip6-loopback
+          fe00::0 ip6-localnet
+          ff00::0 ip6-mcastprefix
+          ff02::1 ip6-allnodes
+          ff02::2 ip6-allrouters
+          ff02::3 ip6-allhosts
+
+    - name: Set hostname
+      hostname:
+        name: "{{jitsisecrets.hostname}}"
+        use: debian
+
+
+    # -> Add jitsi package repo
+
+    - name: Install core packages
+      apt:
+        name:
+          - apt-transport-https
+          - debconf-utils
+          - expect
+          - htop
+          - vim
+          - curl
+          - wget
+          - ca-certificates
+          - jq
+        state: present
+        force_apt_get: yes
+        cache_valid_time: 3600
+        update_cache: yes
+
+    - name: Add key for jitsi repo
+      apt_key:
+        url: https://download.jitsi.org/jitsi-key.gpg.key
+        state: present
+
+    - apt_repository:
+        repo: "deb https://download.jitsi.org stable/"
+        filename: jitsi
+        state: present
+
+    - name: Update package cache
+      apt:
+        autoclean: yes
+        cache_valid_time: 0
+        update_cache: yes
+
+
+    # -> Preconfigure jitsi packages with debconf
+
+    - name: "Configure jitsi-meet package"
+      debconf:
+        name: "{{item[0]}}"
+        question: "{{item[1]}}"
+        value: "{{item[3]}}"
+        vtype: "{{item[2]}}"
+      loop:
+        # root@jitsi:~# debconf-get-selections | grep -P "(jibri|jicofo|jigasi|jitsi)"
+        - [ "jitsi-videobridge2", "jitsi-videobridge/jvb-hostname", "string", "{{jitsisecrets.domain}}" ]
+        - [ "jitsi-meet-web-config", "jitsi-meet/cert-choice", "select", "Generate a new self-signed certificate (You will later get a chance to obtain a Let's encrypt certificate)" ]
+
+
+    # -> Install Jitsi
+
+    - name: Install Jitsi Package
+      apt:
+        name:
+          - jitsi-meet
+          - jitsi-meet-turnserver
+
+
+    # -> Ensure the public ip in coturn config
+
+    # this fixes the following error:
+    # Warning! Could not resolve your external ip address!
+    - name: Ensure the public ip in coturn config
+      lineinfile:
+        path: /etc/turnserver.conf
+        regexp: '^external-ip='
+        line: "external-ip={{jitsisecrets.publicip}}"
+      register: turncfg
+
+    - name: Ensure the public ip in coturn config
+      lineinfile:
+        path: /etc/turnserver.conf
+        regexp: 'no-tcp'
+        line: '# no-tcp'
+      register: turncfgtcp
+
+    - name: Restart coturn if cfg was changed
+      service:
+        name: coturn
+        state: restarted
+      when: turncfg.changed or turncfgtcp.changed
+
+
+    # -> Enable Lets Encrypt
+
+    - name: Check if certbot had created certs yet
+      stat:
+        path: "/etc/letsencrypt/live/{{jitsisecrets.domain}}/fullchain.pem"
+      register: certexists
+
+    - name: Check if the nginx config needs to configured
+      command: grep -Fq "/etc/jitsi/meet/{{jitsisecrets.domain}}.crt" /etc/nginx/sites-available/{{jitsisecrets.domain}}.conf
+      register: nginxisunconfigured
+      changed_when: nginxisunconfigured.rc == 0
+      failed_when: nginxisunconfigured.rc not in [0,1]
+
+    - name: Check if the turnserver config needs to configured
+      command: grep -Fq "/etc/jitsi/meet/{{jitsisecrets.domain}}.crt" /etc/turnserver.conf
+      register: turnunconfigured
+      changed_when: turnunconfigured.rc == 0
+      failed_when: turnunconfigured.rc not in [0,1]
+
+    - name: Execute lets encrypt bootstrap script
+      shell: |
+        set timeout 600
+        spawn /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
+        expect "* email * \\\[ENTER\\\]: "
+        send "{{jitsisecrets.email}}\n"
+        expect eof
+      args:
+        executable: /usr/bin/expect
+      when: certexists.stat.exists == False or nginxisunconfigured.rc == 0
+
+    - name: Enforce the certbook renewal hooks
+      shell: |
+        /etc/letsencrypt/renewal-hooks/deploy/0000-coturn-certbot-deploy.sh
+      environment:
+        RENEWED_LINEAGE: "/etc/letsencrypt/live/{{jitsisecrets.domain}}"
+        RENEWED_DOMAINS: "{{jitsisecrets.domain}}"
+      when: turnunconfigured.rc == 0
+
+    - name: Restart services
+      systemd:
+        name: "{{item}}"
+        state: restarted
+      loop:
+        - nginx
+        - jicofo
+        - jitsi-videobridge2
+        - coturn
+      when: nginxisunconfigured.rc == 0 or turnunconfigured.rc == 0
+
+
+    # -> jitsi-meet config.js
+
+    - name: Jitsi-meet config
+      copy:
+        dest: /etc/jitsi/meet/{{jitsisecrets.domain}}-config.js
+        owner: root
+        group: root
+        mode: u=rw,go=r
+        content: |
+          /* eslint-disable no-unused-vars, no-var */
+
+          var config = {
+              // Connection
+              //
+
+              hosts: {
+                  // XMPP domain.
+                  domain: '{{jitsisecrets.domain}}',
+
+                  // XMPP MUC domain. FIXME: use XEP-0030 to discover it.
+                  muc: 'conference.<!--# echo var="subdomain" default="" -->{{jitsisecrets.domain}}'
+              },
+
+              // BOSH URL. FIXME: use XEP-0156 to discover it.
+              bosh: '//{{jitsisecrets.domain}}/http-bind',
+
+              // The name of client node advertised in XEP-0115 'c' stanza
+              clientNode: 'http://jitsi.org/jitsimeet',
+
+              // Testing / experimental features.
+              testing: {
+                  // Enables experimental simulcast support on Firefox.
+                  enableFirefoxSimulcast: false,
+
+                  // P2P test mode disables automatic switching to P2P when there are 2
+                  // participants in the conference.
+                  p2pTestMode: false
+              },
+
+              // Enabling this will run the lib-jitsi-meet no audio detection module which
+              // will notify the user if the current selected microphone has no audio
+              // input and will suggest another valid device if one is present.
+              enableNoAudioDetection: true,
+
+              // Enabling this will run the lib-jitsi-meet noise detection module which will
+              // notify the user if there is noise, other than voice, coming from the current
+              // selected microphone. The purpose it to let the user know that the input could
+              // be potentially unpleasant for other meeting participants.
+              enableNoisyMicDetection: true,
+
+              // Start the conference in audio only mode (no video is being received nor
+              // sent).
+              startAudioOnly: true,
+
+              // Sets the preferred resolution (height) for local video. Defaults to 720.
+              resolution: 720,
+
+              // The ID of the jidesha extension for Chrome.
+              desktopSharingChromeExtId: null,
+
+              // The media sources to use when using screen sharing with the Chrome
+              // extension.
+              desktopSharingChromeSources: [ 'screen', 'window', 'tab' ],
+
+              // Required version of Chrome extension
+              desktopSharingChromeMinExtVersion: '0.1',
+
+              // Default value for the channel "last N" attribute. -1 for unlimited.
+              channelLastN: -1,
+
+              // Use XEP-0215 to fetch STUN and TURN servers.
+              useStunTurn: true,
+
+              // Enable IPv6 support.
+              useIPv6: true,
+
+              // Require users to always specify a display name.
+              requireDisplayName: true,
+
+              // Whether to use a welcome page or not. In case it's false a random room
+              // will be joined when no room is specified.
+              enableWelcomePage: true,
+
+              // Default language for the user interface.
+              defaultLanguage: 'en',
+
+              // If true all users without a token will be considered guests and all users
+              // with token will be considered non-guests. Only guests will be allowed to
+              // edit their profile.
+              enableUserRolesBasedOnToken: false,
+
+              // Enables calendar integration, depends on googleApiApplicationClientID
+              // and microsoftApiApplicationClientID
+              enableCalendarIntegration: false,
+
+              // Whether to enable stats collection or not in the TraceablePeerConnection.
+              // This can be useful for debugging purposes (post-processing/analysis of
+              // the webrtc stats) as it is done in the jitsi-meet-torture bandwidth
+              // estimation tests.
+              gatherStats: false,
+
+              // enables sending participants display name to callstats
+              enableDisplayNameInStats: false,
+
+              // enables sending participants email if available to callstats and other analytics
+              enableEmailInStats: false,
+
+              // If third party requests are disabled, no other server will be contacted.
+              // This means avatars will be locally generated and callstats integration
+              // will not function.
+              disableThirdPartyRequests: true,
+
+
+              // Peer-To-Peer mode: used (if enabled) when there are just 2 participants.
+              p2p: {
+                  // Enables peer to peer mode. When enabled the system will try to
+                  // establish a direct connection when there are exactly 2 participants
+                  // in the room. If that succeeds the conference will stop sending data
+                  // through the JVB and use the peer to peer connection instead. When a
+                  // 3rd participant joins the conference will be moved back to the JVB
+                  // connection.
+                  enabled: true,
+
+                  // Use XEP-0215 to fetch STUN and TURN servers.
+                  // useStunTurn: true,
+
+                  // The STUN servers that will be used in the peer to peer connections
+                  stunServers: [
+
+                      // { urls: 'stun:jitsi-meet.example.com:4446' },
+                      // { urls: 'stun:meet-jit-si-turnrelay.jitsi.net:443' }
+                      { urls: 'stun:{{jitsisecrets.domain}}:443' }
+                  ],
+
+                  // Sets the ICE transport policy for the p2p connection. At the time
+                  // of this writing the list of possible values are 'all' and 'relay',
+                  // but that is subject to change in the future. The enum is defined in
+                  // the WebRTC standard:
+                  // https://www.w3.org/TR/webrtc/#rtcicetransportpolicy-enum.
+                  // If not set, the effective value is 'all'.
+                  // iceTransportPolicy: 'all',
+
+                  // If set to true, it will prefer to use H.264 for P2P calls (if H.264
+                  // is supported).
+                  preferH264: true
+
+                  // If set to true, disable H.264 video codec by stripping it out of the
+                  // SDP.
+                  // disableH264: false,
+
+                  // How long we're going to wait, before going back to P2P after the 3rd
+                  // participant has left the conference (to filter out page reload).
+                  // backToP2PDelay: 5
+              },
+
+              analytics: { },
+              deploymentInfo: { },
+
+              // Allow all above example options to include a trailing comma and
+              // prevent fear when commenting out the last value.
+              makeJsonParserHappy: 'even if last key had a trailing comma'
+
+              // no configuration value should follow this line.
+          };
+
+          /* eslint-enable no-unused-vars, no-var */
+
+
+    # -> Enable colibri api
+
+    - name: Enable rest interface
+      lineinfile:
+        path: /etc/jitsi/videobridge/config
+        regexp: '^JVB_OPTS='
+        line: 'JVB_OPTS="--apis=rest,xmpp"'
+      register: vbrcfg
+
+    - name: Enable statistics interface
+      lineinfile:
+        path: /etc/jitsi/videobridge/sip-communicator.properties
+        regexp: '^org\.jitsi\.videobridge\.STATISTICS_TRANSPORT='
+        line: 'org.jitsi.videobridge.STATISTICS_TRANSPORT=muc,colibri'
+      register: vbrcoli
+
+    - name: Bind rest interface to localhost
+      lineinfile:
+        path: /etc/jitsi/videobridge/sip-communicator.properties
+        regexp: '^org\.jitsi\.videobridge\.rest\.private\.jetty\.host='
+        line: 'org.jitsi.videobridge.rest.private.jetty.host=127.0.0.1'
+      register: vbrlocal
+
+    - name: Restart Videobridge when config was changed
+      systemd:
+        name: jitsi-videobridge2
+        enabled: yes
+        daemon_reload: yes
+        state: restarted
+      when: vbrcfg.changed or vbrcoli.changed or vbrlocal.changed
+
+
+    # -> Other configs
+
+    - name: robots.txt
+      copy:
+        dest: /usr/share/jitsi-meet/robots.txt
+        content: |
+          User-agent: *
+          Disallow: /
+      tags:
+        - customs
+
+    - name: footer
+      copy:
+        dest: /usr/share/jitsi-meet/static/welcomePageAdditionalContent.html
+        content: |
+          <template id = "welcome-page-additional-content-template">
+              <div style="display: block; margin: 20px 0px; text-align: center;">
+                  Hosted by {{jitsisecrets.owner}} &middot;
+                  <a href="https://jitsi.org/" target="_blank">Powered by Jitsi Meet</a> &middot;
+                  <a href="{{jitsisecrets.imprint}}" target="_blank">Imprint</a> &middot;
+                  <a href="{{jitsisecrets.privacy}}" target="_blank">Privacy</a>
+              </div>
+          </template>
+
+          <style>
+              .welcome > .welcome-watermark {
+                  width: auto;
+                  height: auto;
+              }
+          </style>
+      tags:
+        - customs
+
+
+    #-> Local check
+
+    # Hint: This plugin needs to added manually to check_mk check directory
+    # with a symlink for example
+    - name: Jitsi Check_MK Plugin
+      copy:
+        dest: /usr/bin/check_jitsi
+        owner: root
+        group: root
+        mode: u=rwx,go=rx
+        content: |
+          #!/bin/bash
+
+          JSON=$(curl -s http://127.0.0.1:8080/colibri/stats)
+          JCODE=$?
+
+          VERSION=$(curl -s http://127.0.0.1:8080/about/version)
+          JVERSION=$?
+
+          service=jitsi-meet
+          scode=3
+          sname=Unknown
+          metrics="-"
+          detail="No more output"
+
+          if [ $JCODE -eq 0 ] && [ $JVERSION -eq 0 ]
+          then
+
+              m_bitsdown=$(echo "$JSON" | jq -r .bit_rate_download)
+              m_bitsup=$(echo "$JSON" | jq -r .bit_rate_upload)
+              m_confer=$(echo "$JSON" | jq -r .conferences)
+              m_partici=$(echo "$JSON" | jq -r .participants)
+              m_threads=$(echo "$JSON" | jq -r .threads)
+              m_videostr=$(echo "$JSON" | jq -r .videostreams)
+
+              scode=0
+              sname=OK
+              metrics="bitrate_download=$m_bitsdown|bitrate_upload=$m_bitsup|conference_count=$m_confer|participant_count=$m_partici|thread_count=$m_threads|videostream_count=$m_videostr"
+              detail="Conferences: $m_confer; Participants: $m_partici;"
+
+          else
+              scode=2
+              sname=Critical
+              detail="Connection to REST API failed"
+          fi
+
+          echo "$scode $service $metrics $sname: $detail"
